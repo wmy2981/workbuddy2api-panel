@@ -39,12 +39,14 @@ func TestSanitizeBrandUntouchedOutsideSystem(t *testing.T) {
 	}
 }
 
-// 消息级：同一请求里 system 的品牌词被改写，user / assistant 的逐字不动。
+// 消息级：同一请求里 system 的品牌词被改写，user / tool / assistant 的逐字不动。
 func TestSanitizeMessagesBrandSystemOnly(t *testing.T) {
 	msgs := []any{
 		map[string]any{"role": "developer", "content": "powered by " + brand},
 		map[string]any{"role": "system", "content": "powered by " + brand},
 		map[string]any{"role": "user", "content": "echo " + brand},
+		// 工具读取结果（role=tool）同样是模型输入字段，必须逐字保真。
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "file says " + brand},
 		map[string]any{"role": "assistant", "content": "echo " + brand},
 		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
 			map[string]any{"id": "c1", "type": "function", "function": map[string]any{
@@ -58,16 +60,17 @@ func TestSanitizeMessagesBrandSystemOnly(t *testing.T) {
 	}
 	get := func(i int) map[string]any { return msgs[i].(map[string]any) }
 	for i, want := range []string{
-		"powered by DSH", // developer：与 system 同级，改写
-		"powered by DSH", // system：改写
-		"echo " + brand,  // user：逐字不动
-		"echo " + brand,  // assistant（模型输出）：逐字不动
+		"powered by DSH",     // developer：与 system 同级，改写
+		"powered by DSH",     // system：改写
+		"echo " + brand,      // user：逐字不动
+		"file says " + brand, // tool 读取结果：逐字不动
+		"echo " + brand,      // assistant（模型输出）：逐字不动
 	} {
 		if got, _ := get(i)["content"].(string); got != want {
 			t.Errorf("msgs[%d].content = %q, want %q", i, got, want)
 		}
 	}
-	fn := get(4)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	fn := get(5)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	if args, _ := fn["arguments"].(string); !strings.Contains(args, brand) {
 		t.Errorf("tool_calls arguments 品牌词被改写: %q", args)
 	}
