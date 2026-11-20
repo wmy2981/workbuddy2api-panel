@@ -470,7 +470,7 @@ curl -s http://localhost:7863/v1/search/messages \
 - 触发后持续到**次日 00:00 CST**（Asia/Shanghai）重置；降级期内携带同一提示词的 `passthrough` 请求直达中性提示词，不再先撞 400
 - 降级状态是**进程内存态**，重启清零
 - 内容问题非账号问题：`ErrContentBlocked` 不罚账号（无冷却 / 熔断 / 计错），由网关降级重试消化
-- 11-128 的 `unapproved channel` / `illegal api invocation` 同样走这条降级重试：实测 CN 域的上游渠道校验会被**客户端 system 提示词里的竞品身份串**触发（dsh 的 agent 提示词含 `DeepSeek`，必撞）。`features.sanitize_blacklist_fingerprints` 开启时该串在出站前改写成零宽变体，整份提示词直接通过；关闭时只能靠降级把 system 换成中性文本
+- 11-128 的 `unapproved channel` / `illegal api invocation` 同样走这条降级重试：实测 CN 域的上游渠道校验会被**客户端 system 提示词里的竞品身份串**触发（dsh 的 agent 提示词含 `DeepSeek`，必撞）。`features.sanitize_blacklist_fingerprints` 开启时该串在 **system 消息内**出站前改写成 `DSH`，整份 agent 提示词直接通过；**用户提示词、模型输出与工具参数不做品牌词改写**（逐字保真，「原样输出」类指令的回显不会失真），用户正文自带该串时按内容拦截如实报错。关闭开关时只能靠降级把 system 换成中性文本
 
 ### 原生工具调用标记还原
 

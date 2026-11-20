@@ -13,14 +13,21 @@ import (
 // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
 // 普通请求全不中 → 原样返回，零分配）。
 var sanitizeFeatures = []string{
-	"x-anthropic-billing-header", // header 键值段键名
-	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
-	"You are Claude Code",        // 身份句（截断前缀即可命中）
-	"Main branch (",              // 注入指令句（截断前缀即可命中）
+	"x-anthropic-billing-header",                      // header 键值段键名
+	"cc_entrypoint=",                                  // 尾随裸键值（截断前缀即可命中）
+	"You are Claude Code",                             // 身份句（截断前缀即可命中）
+	"Main branch (",                                   // 注入指令句（截断前缀即可命中）
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
-	"DeepSeek Harness",                                // 竞品身份串（CN 域渠道校验按它拦整单）
 	"11128",                                           // 上游反探测：裸数字错误码
+}
+
+// sanitizeBrandFeatures system 级指令（system/developer 消息）专属的预检特征：竞品身份串。
+//
+// 与 sanitizeFeatures 分开，是为了让品牌词改写只发生在 system 提示词里：用户提示词与
+// 模型输出是用户可见的业务文本，改一个字就是内容失真（见 sanitizeTextMode）。
+var sanitizeBrandFeatures = []string{
+	"DeepSeek Harness", // 竞品身份串（CN 域渠道校验按它拦整单）
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -77,21 +84,48 @@ var sanitizeRewrites = [][2]string{
 		"11128",
 		"11-128",
 	},
+}
+
+// sanitizeBrandRewrites 竞品品牌词改写表：**只作用于 system/developer 消息**。
+//
+// 背景：CN 域（copilot.tencent.com）的渠道校验按 system 提示词里的竞品身份串拦整单
+// （400 code=11-128 "Illegal API invocation from an unapproved channel"）。2026-10-25
+// 实测：把 dsh 那份 7.4KB agent 提示词里的三处换成 "DSH" 后整段通过；不换则必拦，
+// 只能靠降级把 system 整段换成中性文本（等于丢掉 agent 的全部指令）。
+//
+// 为什么只改 system：user / assistant / tool 消息承载用户提示词、模型输出与工具参数，
+// 是用户可见的业务文本，改词即失真——用户让模型「原样输出」竞品词时会被换成 "DSH"，
+// 回显对不上。代价：用户正文自带该串时仍可能撞 CN 渠道校验，此时按内容拦截
+// （ErrContentBlocked）如实报错，不做静默改写。
+var sanitizeBrandRewrites = [][2]string{
+	// 只改一个词，语义不变（"powered by <brand>" → "powered by DSH"）。
 	{
-		// 竞品身份串：CN 域（copilot.tencent.com）的渠道校验按 system 提示词里的
-		// "DeepSeek Harness" 拦整单（400 code=11-128 "Illegal API invocation from an
-		// unapproved channel"）。2026-10-25 实测：三处出现全换成 "DeepSeek" 后，
-		// dsh 那份 7.4KB 的 agent 提示词整段通过；不换则必拦，只能靠降级把 system
-		// 整段换成中性文本（等于丢掉 agent 的全部指令）。
-		// 只改一个词，语义不变（"powered by DeepSeek Harness" → "powered by DSH"）。
 		"DeepSeek Harness",
 		"DSH",
 	},
 }
 
-// sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
-func sanitizeText(text string) string {
-	if !hasFingerprint(text) {
+// sanitizeText 非 system 文本净化（user / assistant / tool 消息、思维链、工具参数）：
+// 只做反指纹改写，**不动竞品品牌词**——这些是用户可见的业务文本。
+func sanitizeText(text string) string { return sanitizeTextMode(text, false) }
+
+// sanitizeSystemText system 级指令净化（system 消息）：反指纹改写 + 竞品品牌词改写。
+func sanitizeSystemText(text string) string { return sanitizeTextMode(text, true) }
+
+// sanitizeTextMode 单段文本净化：预检不中 → 返回原串（零分配）。
+//
+// system 与非 system 的唯一差别是竞品品牌词（sanitizeBrandRewrites）：CN 域渠道校验
+// 拦的是 system 提示词里的品牌串，改写它只为让 agent 指令整段通过；用户提示词与模型
+// 输出必须逐字保真，否则「原样输出」类指令的回显会失真。
+func sanitizeTextMode(text string, system bool) string {
+	if system {
+		if !hasSystemFingerprint(text) {
+			return text
+		}
+		for _, rw := range sanitizeBrandRewrites {
+			text = strings.ReplaceAll(text, rw[0], rw[1])
+		}
+	} else if !hasFingerprint(text) {
 		return text
 	}
 	for _, rw := range sanitizeRewrites {
@@ -126,12 +160,31 @@ func hasFingerprint(text string) bool {
 	return sanitizeBareHdrRe.MatchString(text)
 }
 
+// hasSystemFingerprint system 级指令预检：在通用特征之外加上竞品品牌串。
+func hasSystemFingerprint(text string) bool {
+	return hasFingerprint(text) || hasBrandFingerprint(text)
+}
+
+// hasBrandFingerprint 只查竞品品牌串（sanitizeBrandFeatures）。
+func hasBrandFingerprint(text string) bool {
+	for _, f := range sanitizeBrandFeatures {
+		if strings.Contains(text, f) {
+			return true
+		}
+	}
+	return false
+}
+
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
 // 返回净化后的值及是否发生变化。
-func sanitizeContent(v any) (any, bool) {
+func sanitizeContent(v any, system bool) (any, bool) {
+	pick := sanitizeText
+	if system {
+		pick = sanitizeSystemText
+	}
 	switch c := v.(type) {
 	case string:
-		s := sanitizeText(c)
+		s := pick(c)
 		return s, s != c
 	case []any:
 		changed := false
@@ -144,7 +197,7 @@ func sanitizeContent(v any) (any, bool) {
 			if !ok {
 				continue
 			}
-			if s := sanitizeText(text); s != text {
+			if s := pick(text); s != text {
 				m["text"] = s
 				changed = true
 			}
@@ -197,8 +250,14 @@ func sanitizeMessages(messages []any) bool {
 		}
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
+		// system / developer（normalizeRoles 已把 developer 归一为 system）才走品牌词
+		// 改写；其余角色是用户可见文本，只洗反指纹串。
+		// developer 与 system 同级（normalizeRoles 会把前者归一为后者；此处一并认，
+		// 避免调用方漏归一化时品牌词改写被静默跳过）。
+		role, _ := m["role"].(string)
+		system := strings.EqualFold(role, "system") || strings.EqualFold(role, "developer")
 		if c, ok := m["content"]; ok {
-			if nc, ch := sanitizeContent(c); ch {
+			if nc, ch := sanitizeContent(c, system); ch {
 				m["content"] = nc
 				changed = true
 			}
